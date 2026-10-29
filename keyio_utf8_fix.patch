@@ -1,0 +1,189 @@
+--- a/src/keyio/_posix.py
++++ b/src/keyio/_posix.py
+@@ -1,8 +1,10 @@
++import codecs
+ import os
+ import select
+ import sys
+ import termios
+ import tty
++from collections import deque
+ 
+ from .keys import Key
+ 
+@@ -30,7 +32,14 @@
+         self.fd = None
+         self.old_settings = None
+         self.owns_fd = False
++        # Keep unfinished UTF-8 sequences between non-blocking read() calls.
++        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
++        self._pending_keys = deque()
++
+     def setup(self):
++        self._decoder.reset()
++        self._pending_keys.clear()
++
+         if sys.stdin.isatty():
+             self.fd = sys.stdin.fileno()
+ 
+@@ -55,8 +64,22 @@
+         self.fd = None
+         self.old_settings = None
+         self.owns_fd = False
++        self._decoder.reset()
++        self._pending_keys.clear()
++
++    def _emit_control(self, key):
++        # A control key interrupts an unfinished UTF-8 sequence. Keep the
++        # replacement character (if any) and the control event in order.
++        self._pending_keys.extend(self._decoder.decode(b"", final=True))
++        self._decoder.reset()
++        if key is not None:
++            self._pending_keys.append(key)
++        return self._pending_keys.popleft() if self._pending_keys else None
+ 
+     def read(self):
++        if self._pending_keys:
++            return self._pending_keys.popleft()
++
+         ready, _, _ = select.select(
+             [self.fd],
+             [],
+@@ -68,26 +91,28 @@
+             return None
+ 
+         key = os.read(self.fd, 1)
++        if not key:
++            return None
+ 
+         if key == b"\x1b":
+-            return self._read_escape_sequence()
++            return self._emit_control(self._read_escape_sequence())
+         if key in (b"\r", b"\n"):
+-            return Key.ENTER
++            return self._emit_control(Key.ENTER)
+ 
+         if key == b"\t":
+-            return Key.TAB
++            return self._emit_control(Key.TAB)
+ 
+         if key in (b"\x7f", b"\x08"):
+-            return Key.BACKSPACE
++            return self._emit_control(Key.BACKSPACE)
+ 
+         if key == b" ":
+-            return Key.SPACE
++            return self._emit_control(Key.SPACE)
+ 
+-        try:
+-            return key.decode()
+-
+-        except UnicodeDecodeError:
+-            return None
++        # One os.read() byte is not necessarily one Unicode character.
++        # decode() returns an empty string until the character is complete.
++        # A malformed sequence can emit multiple characters, so queue them.
++        self._pending_keys.extend(self._decoder.decode(key, final=False))
++        return self._pending_keys.popleft() if self._pending_keys else None
+ 
+     def _read_escape_sequence(self):
+         sequence = b"\x1b"
+@@ -98,6 +123,10 @@
+             0.01,
+         )[0]:
+             sequence += os.read(self.fd, 1)
++            # Stop once a recognized key is complete; do not swallow the
++            # following event when multiple keys arrive in the same batch.
++            if sequence in ESCAPE_SEQUENCES:
++                return ESCAPE_SEQUENCES[sequence]
+ 
+         if sequence == b"\x1b":
+             return Key.ESCAPE
+--- /dev/null
++++ b/tests/test_utf8.py
+@@ -0,0 +1,85 @@
++"""POSIX backend tests: fake terminal bytes, no interactive TTY needed."""
++
++import os
++import sys
++import unittest
++from collections import deque
++from pathlib import Path
++from unittest.mock import patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++
++from keyio._posix import PosixKeyboard
++from keyio.keys import Key
++
++
++@unittest.skipUnless(os.name == "posix", "POSIX tests only")
++class PosixUtf8Tests(unittest.TestCase):
++    def setUp(self):
++        self.keyboard = PosixKeyboard()
++        self.keyboard.fd = 42
++        self.bytes = deque()
++
++        def fake_select(read, write, error, timeout):
++            return (read if self.bytes else [], [], [])
++
++        def fake_read(fd, count):
++            self.assertEqual(fd, 42)
++            return bytes((self.bytes.popleft(),)) if self.bytes else b""
++
++        self.select_patch = patch("keyio._posix.select.select", side_effect=fake_select)
++        self.read_patch = patch("keyio._posix.os.read", side_effect=fake_read)
++        self.select_patch.start()
++        self.read_patch.start()
++        self.addCleanup(self.select_patch.stop)
++        self.addCleanup(self.read_patch.stop)
++
++    def feed(self, data):
++        self.bytes.extend(data)
++
++    def drain(self):
++        results = []
++        while self.bytes or self.keyboard._pending_keys:
++            result = self.keyboard.read()
++            if result is not None:
++                results.append(result)
++        return results
++
++    def test_finnish_letters(self):
++        self.feed("äÄöÖåÅ".encode("utf-8"))
++        self.assertEqual(self.drain(), list("äÄöÖåÅ"))
++
++    def test_unicode_2_3_4_bytes(self):
++        self.feed("é€🔥".encode("utf-8"))
++        self.assertEqual(self.drain(), ["é", "€", "🔥"])
++
++    def test_partial_sequence_never_blocks(self):
++        self.feed(b"\xc3")
++        self.assertIsNone(self.keyboard.read())
++        self.assertIsNone(self.keyboard.read())
++        self.feed(b"\xa4")
++        self.assertEqual(self.keyboard.read(), "ä")
++
++    def test_ascii_and_control_keys(self):
++        self.feed(b"a \r\t\x7f")
++        self.assertEqual(self.drain(), ["a", Key.SPACE, Key.ENTER, Key.TAB, Key.BACKSPACE])
++
++    def test_arrow_and_escape(self):
++        self.feed(b"\x1b[A\x1b")
++        self.assertEqual(self.drain(), [Key.UP, Key.ESCAPE])
++
++    def test_consecutive_arrow_keys_and_unicode(self):
++        self.feed(b"\x1b[A\x1b[B" + "Ä".encode("utf-8"))
++        self.assertEqual(self.drain(), [Key.UP, Key.DOWN, "Ä"])
++
++    def test_invalid_utf8_does_not_swallow_following_ascii(self):
++        self.feed(b"\xc3Z")
++        self.assertEqual(self.drain(), ["\ufffd", "Z"])
++
++    def test_partial_utf8_followed_by_control(self):
++        self.feed(b"\xc3\r")
++        self.assertEqual(self.drain(), ["\ufffd", Key.ENTER])
++
++
++if __name__ == "__main__":
++    unittest.main()
