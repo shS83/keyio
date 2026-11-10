@@ -1,7 +1,7 @@
 [project]
 name = "keyio"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.1.1"
+description = "Keyboard interface for POSIX/Windows"
 readme = "README.md"
 authors = [
     { name = "Santeri 'shS' Saarinen", email = "shs.is.acrux@gmail.com" }
